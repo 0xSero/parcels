@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# parcels — ship the current agent session to a remote box over Tailscale,
+# run it inside a persistent tmux session, reattach from anywhere.
+#
+# One string, three uses: parcel dir name == tmux session name == attach target.
+# The filesystem is the registry (ls ~/.parcels).
+#
+# Test hooks (do not rely on in normal use):
+#   PARCELS_DRY_RUN=1   print commands instead of executing
+#   PARCELS_LOCAL=1     run "remote" locally (fake host dir, real local tmux)
+#   PARCELS_HOME=...    override parcels dir (default ~/.parcels)
+#   PARCELS_HOST=...    override remote host (default pop-os)
+#   PARCELS_SSH=...     override ssh command (default ssh)
+#   PARCELS_RSYNC=...   override rsync command (default rsync)
+#   PARCELS_BIN=...     parcels script path (for self-reference in tests)
+
+set -euo pipefail
+
+PARCELS_VERSION="0.1.0"
+PARCELS_HOME="${PARCELS_HOME:-$HOME/.parcels}"
+PARCELS_HOST="${PARCELS_HOST:-pop-os}"
+PARCELS_SSH_CMD="${PARCELS_SSH:-ssh}"
+PARCELS_RSYNC_CMD="${PARCELS_RSYNC:-rsync}"
+DRY_RUN="${PARCELS_DRY_RUN:-0}"
+LOCAL_MODE="${PARCELS_LOCAL:-0}"
+
+# ---------------------------------------------------------------------------
+# Pure functions (unit-tested)
+# ---------------------------------------------------------------------------
+
+sanitize_name() {
+  # lowercase; . : / space -> -; strip non [a-z0-9_-]; collapse runs; trim ends
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr '.:/ ' '----' \
+    | sed 's/[^a-z0-9_-]//g; s/-\{2,\}/-/g; s/^-//; s/-$//'
+}
+
+default_name() {
+  sanitize_name "$(basename "$1")"
+}
+
+# parse_config <file> -> echoes "key=value" lines, comments/blanks stripped
+parse_config() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  grep -v '^[[:space:]]*#' "$file" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' || true
+}
+
+# config_get <file> <key> -> value (first match), empty if absent
+config_get() {
+  local file="$1" key="$2"
+  parse_config "$file" | awk -F= -v k="$key" '
+    $1 ~ ("^" space "*" k space "*$") { sub(/^[^=]*=/, ""); print; exit }
+  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# json_escape <string> -> JSON-safe string (quotes + backslashes + newlines)
+json_escape() {
+  # minimal JSON string escape; input has no control chars in practice
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
+}
+
+# gen_manifest <name> <agent> <source_cwd> <remote> <model> <has_session>
+# echoes manifest JSON to stdout
+gen_manifest() {
+  local name="$1" agent="$2" source_cwd="$3" remote="$4" model="$5" has_session="$6"
+  cat <<EOF
+{
+  "parcels_version": "${PARCELS_VERSION}",
+  "name": "$(json_escape "$name")",
+  "agent": "$(json_escape "$agent")",
+  "model": "$(json_escape "$model")",
+  "source_cwd": "$(json_escape "$source_cwd")",
+  "remote": "$(json_escape "$remote")",
+  "has_session": ${has_session},
+  "created": $(date +%s)
+}
+EOF
+}
+
+# gen_run_sh <remote_parcel_dir> <agent> <model> <has_session>
+# echoes run.sh content to stdout
+gen_run_sh() {
+  local remote_parcel_dir="$1" agent="$2" model="$3" has_session="$4"
+  local project_dir="$remote_parcel_dir/project"
+  local session_file="$remote_parcel_dir/session.jsonl"
+  local model_flag=""
+  [ -n "$model" ] && model_flag="--model \"$(json_escape "$model")\""
+  cat <<EOF
+#!/usr/bin/env bash
+set -e
+cd "$(json_escape "$project_dir")"
+EOF
+  if [ "$agent" = "pi" ]; then
+    if [ "$has_session" = "true" ]; then
+      cat <<EOF
+exec pi ${model_flag} --session "$(json_escape "$session_file")" --session-dir "$(json_escape "$remote_parcel_dir")"
+EOF
+    else
+      cat <<EOF
+exec pi ${model_flag}
+EOF
+    fi
+  elif [ "$agent" = "claude" ]; then
+    cat <<EOF
+exec claude ${model_flag} --resume || exec claude ${model_flag}
+EOF
+  elif [ "$agent" = "codex" ]; then
+    cat <<EOF
+exec codex ${model_flag} resume || exec codex ${model_flag}
+EOF
+  else
+    cat <<EOF
+exec ${agent} ${model_flag}
+EOF
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Transport helpers — honor DRY_RUN and LOCAL_MODE
+# ---------------------------------------------------------------------------
+
+# in local mode, the "remote" parcels dir is $PARCELS_HOME/_local_remote
+# resolve remote $HOME once (cached) so we use absolute paths (safe to single-quote)
+_REMOTE_HOME=""
+remote_home() {
+  if [ "$LOCAL_MODE" = "1" ]; then printf '%s' "$HOME"; return; fi
+  if [ -z "$_REMOTE_HOME" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      _REMOTE_HOME="~"   # display placeholder; not executed
+    else
+      _REMOTE_HOME="$($PARCELS_SSH_CMD "$PARCELS_HOST" 'printf %s "$HOME"')"
+    fi
+  fi
+  printf '%s' "$_REMOTE_HOME"
+}
+
+remote_parcel_root() {
+  if [ "$LOCAL_MODE" = "1" ]; then
+    printf '%s/_local_remote' "$PARCELS_HOME"
+  else
+    printf '%s/.parcels' "$(remote_home)"
+  fi
+}
+
+# run_remote <shell-command> : execute on the remote host (or locally in LOCAL_MODE)
+run_remote() {
+  local cmd="$1"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'REMOTE: %s\n' "$cmd"
+    return 0
+  fi
+  if [ "$LOCAL_MODE" = "1" ]; then
+    bash -c "$cmd"
+  else
+    $PARCELS_SSH_CMD "$PARCELS_HOST" "$cmd"
+  fi
+}
+
+# rsync_to_remote <local_src/> <remote_dest>
+rsync_to_remote() {
+  local src="$1" dest="$2"
+  if [ "$DRY_RUN" = "1" ]; then
+    local shown="$dest"
+    [ "$LOCAL_MODE" = "1" ] || shown="${PARCELS_HOST}:${dest}"
+    printf 'RSYNC:  rsync -a --delete %s %s\n' "$src" "$shown"
+    return 0
+  fi
+  if [ "$LOCAL_MODE" = "1" ]; then
+    mkdir -p "$dest"
+    $PARCELS_RSYNC_CMD -a --delete "$src" "$dest"
+  else
+    $PARCELS_RSYNC_CMD -a --delete "$src" "${PARCELS_HOST}:${dest}"
+  fi
+}
+
+# rsync_from_remote <remote_src/> <local_dest/>
+rsync_from_remote() {
+  local src="$1" dest="$2"
+  if [ "$DRY_RUN" = "1" ]; then
+    local shown="$src"
+    [ "$LOCAL_MODE" = "1" ] || shown="${PARCELS_HOST}:${src}"
+    printf 'RSYNC:  rsync -a %s %s\n' "$shown" "$dest"
+    return 0
+  fi
+  if [ "$LOCAL_MODE" = "1" ]; then
+    $PARCELS_RSYNC_CMD -a "$src" "$dest"
+  else
+    $PARCELS_RSYNC_CMD -a "${PARCELS_HOST}:${src}" "$dest"
+  fi
+}
+
+# remote_tmux_has <session> -> 0 if exists, non-zero otherwise
+remote_tmux_has() {
+  local session="$1"
+  local root; root=$(remote_parcel_root)
+  if [ "$LOCAL_MODE" = "1" ]; then
+    tmux has-session -t "$session" 2>/dev/null
+  else
+    $PARCELS_SSH_CMD "$PARCELS_HOST" "tmux has-session -t '$session' 2>/dev/null"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_push() {
+  local name="" replace=0 session_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --replace) replace=1; shift ;;
+      --session) session_arg="$2"; shift 2 ;;
+      --session=*) session_arg="${1#--session=}"; shift ;;
+      -*) echo "parcels: unknown flag $1" >&2; exit 2 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
+  local cwd; cwd="$(pwd)"
+  local config_file="$cwd/.parcels"
+  local agent; agent="$(config_get "$config_file" agent)"; [ -n "$agent" ] || agent=pi
+  local model; model="$(config_get "$config_file" model)"
+  local remote; remote="$(config_get "$config_file" remote)"; [ -n "$remote" ] || remote="$PARCELS_HOST"
+  local config_name; config_name="$(config_get "$config_file" name)"
+  [ -n "$config_name" ] && [ -z "$name" ] && name="$config_name"
+  [ -n "$name" ] || name="$(default_name "$cwd")"
+  name="$(sanitize_name "$name")"
+  [ -n "$name" ] || { echo "parcels: could not derive a name (empty cwd basename?)" >&2; exit 2; }
+
+  local local_dir="$PARCELS_HOME/$name"
+
+  # collision check (local dir OR remote tmux session)
+  local collides_local=0 collides_remote=0
+  [ -d "$local_dir" ] && collides_local=1
+  remote_tmux_has "$name" >/dev/null 2>&1 && collides_remote=1
+  if [ "$collides_local" = "1" ] || [ "$collides_remote" = "1" ]; then
+    if [ "$replace" = "0" ]; then
+      cat >&2 <<EOF
+✗ Parcel '$name' already exists
+  → parcels attach $name            # reattach to the running session
+  → parcels push ${name}-2          # start a second parallel session
+  → parcels push $name --replace    # kill old + reship (loses remote state)
+EOF
+      exit 1
+    fi
+    # --replace: tear down first
+    run_remote "tmux kill-session -t '$name' 2>/dev/null || true"
+    rm -rf "$local_dir"
+  fi
+
+  mkdir -p "$local_dir/project"
+
+  # session discovery
+  local session_src="" has_session=false
+  if [ -n "$session_arg" ] && [ -f "$session_arg" ]; then
+    session_src="$session_arg"
+  elif [ "$agent" = "pi" ]; then
+    # find latest jsonl under ~/.pi/agent/sessions/ for this cwd's encoded dir
+    local enc; enc="$(printf '%s' "$cwd" | sed 's,/,--,g')"
+    local sdir="$HOME/.pi/agent/sessions/$enc"
+    if [ -d "$sdir" ]; then
+      session_src="$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1 || true)"
+    fi
+  fi
+  [ -n "$session_src" ] && [ -f "$session_src" ] && has_session=true
+
+  # write manifest + run.sh locally, then sync
+  gen_manifest "$name" "$agent" "$cwd" "$remote" "$model" "$has_session" > "$local_dir/manifest.json"
+  local remote_root; remote_root=$(remote_parcel_root)
+  gen_run_sh "$remote_root/$name" "$agent" "$model" "$has_session" > "$local_dir/run.sh"
+  chmod +x "$local_dir/run.sh"
+
+  if [ "$has_session" = "true" ]; then
+    cp "$session_src" "$local_dir/session.jsonl"
+  fi
+
+  # sync project working tree (honoring excludes)
+  # ensure the remote parcel/project dir exists before rsyncing into it
+  run_remote "mkdir -p '$remote_root/$name/project'"
+  local excludes=(--exclude='.git/' --exclude='node_modules/' --exclude='.venv/'
+                  --exclude='venv/' --exclude='dist/' --exclude='build/'
+                  --exclude='__pycache__/' --exclude='*.pyc' --exclude='.parcels')
+  local cfg_exclude; cfg_exclude="$(config_get "$config_file" exclude)"
+  if [ -n "$cfg_exclude" ]; then
+    for e in $cfg_exclude; do excludes+=(--exclude "$e"); done
+  fi
+
+  if [ "$LOCAL_MODE" = "1" ]; then
+    mkdir -p "$remote_root/$name/project"
+    $PARCELS_RSYNC_CMD -a "${excludes[@]}" "$cwd/" "$remote_root/$name/project/"
+  elif [ "$DRY_RUN" = "1" ]; then
+    printf 'RSYNC:  rsync -a %s %s %s:%s/project/\n' "${excludes[*]}" "$cwd/" "$remote" "$remote_root/$name"
+  else
+    $PARCELS_RSYNC_CMD -a "${excludes[@]}" "$cwd/" "${remote}:${remote_root}/${name}/project/"
+  fi
+
+  # ship the parcel scaffolding
+  rsync_to_remote "$local_dir/" "$remote_root/$name"
+
+  # launch in tmux
+  local launcher="bash $remote_root/$name/run.sh"
+  run_remote "tmux new-session -d -s '$name' '$launcher'"
+
+  if [ "$DRY_RUN" = "0" ]; then
+    cat <<EOF
+✓ Parcel '$name' shipped to $remote
+  agent:   $agent
+  project: $cwd
+  session: $( [ "$has_session" = "true" ] && echo "resumed from snapshot" || echo "fresh" )
+  attach:  parcels attach $name
+EOF
+  fi
+}
+
+cmd_attach() {
+  local name="$1"
+  [ -n "$name" ] || { echo "usage: parcels attach <name>" >&2; exit 2; }
+  name="$(sanitize_name "$name")"
+  if [ "$DRY_RUN" = "1" ]; then
+    if [ "$LOCAL_MODE" = "1" ]; then
+      printf 'EXEC:   tmux attach -t %s\n' "$name"
+    else
+      printf 'EXEC:   %s -t %s tmux attach -t %s\n' "$PARCELS_SSH_CMD" "$PARCELS_HOST" "$name"
+    fi
+    return 0
+  fi
+  if [ "$LOCAL_MODE" = "1" ]; then
+    exec tmux attach -t "$name"
+  fi
+  exec $PARCELS_SSH_CMD -t "$PARCELS_HOST" "tmux attach -t '$name'"
+}
+
+cmd_list() {
+  printf '%-22s %-8s %-10s %-40s %s\n' NAME AGENT STATUS PROJECT REMOTE
+  [ -d "$PARCELS_HOME" ] || return 0
+  local d name manifest agent source_cwd remote status
+  for d in "$PARCELS_HOME"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    [ "$name" = "_local_remote" ] && continue
+    manifest="$d/manifest.json"
+    if [ -f "$manifest" ]; then
+      agent="$(grep -o '"agent":[[:space:]]*"[^"]*"' "$manifest" | head -1 | sed 's/.*"agent":[[:space:]]*"//; s/"$//')"
+      source_cwd="$(grep -o '"source_cwd":[[:space:]]*"[^"]*"' "$manifest" | head -1 | sed 's/.*"source_cwd":[[:space:]]*"//; s/"$//')"
+      remote="$(grep -o '"remote":[[:space:]]*"[^"]*"' "$manifest" | head -1 | sed 's/.*"remote":[[:space:]]*"//; s/"$//')"
+    else
+      agent="-"; source_cwd="-"; remote="$PARCELS_HOST"
+    fi
+    if remote_tmux_has "$name" >/dev/null 2>&1; then status="● live"; else status="○ stopped"; fi
+    printf '%-22s %-8s %-10s %-40s %s\n' "$name" "$agent" "$status" "$source_cwd" "$remote"
+  done
+}
+
+cmd_pull() {
+  local name="$1"
+  [ -n "$name" ] || { echo "usage: parcels pull <name>" >&2; exit 2; }
+  name="$(sanitize_name "$name")"
+  local local_dir="$PARCELS_HOME/$name"
+  local remote_root; remote_root=$(remote_parcel_root)
+  rsync_from_remote "$remote_root/$name/project/" "$local_dir/project/"
+  rsync_from_remote "$remote_root/$name/session.jsonl" "$local_dir/" 2>/dev/null || true
+  if [ "$DRY_RUN" = "0" ]; then
+    echo "✓ Pulled '$name' back to $local_dir"
+  fi
+}
+
+cmd_rm() {
+  local name="$1"
+  [ -n "$name" ] || { echo "usage: parcels rm <name>" >&2; exit 2; }
+  name="$(sanitize_name "$name")"
+  [ -n "$name" ] || { echo "parcels: invalid name" >&2; exit 2; }
+  local remote_root; remote_root=$(remote_parcel_root)
+  local remote_path="$remote_root/$name"
+  # safety: the target must live directly under the parcels root
+  case "$remote_path" in
+    "$remote_root"/""|"$remote_root"/) echo "parcels: refusing to rm the parcels root" >&2; exit 2 ;;
+  esac
+  run_remote "tmux kill-session -t '$name' 2>/dev/null || true"
+  # use `command rm` (the real binary) so we bypass interactive shell guards
+  # (e.g. safe-rm functions) for the parcel's own managed directory.
+  run_remote "command rm -rf '$remote_path'"
+  if [ "$DRY_RUN" = "0" ]; then
+    rm -rf "$PARCELS_HOME/$name"
+    echo "✓ Removed parcel '$name'"
+  fi
+}
+
+cmd_version() { echo "parcels $PARCELS_VERSION"; }
+
+cmd_help() {
+  cat <<EOF
+parcels $PARCELS_VERSION — ship agent sessions to a remote box over Tailscale
+
+Usage:
+  parcels push [name] [--session <path>] [--replace]
+      Snapshot current session + working tree, ship to remote, launch in tmux.
+  parcels attach <name>
+      Reattach to the live tmux session on the remote.
+  parcels list
+      Show all parcels and their live status.
+  parcels pull <name>
+      rsync working tree + session back to the local parcel dir.
+  parcels rm <name>
+      Kill tmux session + delete parcel on remote and locally.
+  parcels version
+  parcels help
+
+Config (optional, in project root .parcels):
+  agent=pi           # pi (default) | claude | codex | opencode
+  model=...          # optional model override passed to the agent
+  remote=pop-os      # Tailscale host (default pop-os)
+  name=...           # override default parcel name
+  exclude=dir1 dir2  # extra rsync excludes
+  env=.env secrets   # files to ship verbatim (future)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    push) cmd_push "$@" ;;
+    attach|a) cmd_attach "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    pull) cmd_pull "$@" ;;
+    rm|remove) cmd_rm "$@" ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h) cmd_help ;;
+    # internal: expose pure fns for tests
+    _sanitize) sanitize_name "$@" ;;
+    _default_name) default_name "$@" ;;
+    _gen_manifest) gen_manifest "$@" ;;
+    _gen_run_sh) gen_run_sh "$@" ;;
+    _config_get) config_get "$@" ;;
+    *) echo "parcels: unknown command '$cmd' (try: parcels help)" >&2; exit 2 ;;
+  esac
+}
+
+# only run main when executed, not when sourced (for tests)
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+  main "$@"
+fi

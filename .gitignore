@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+._*
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# any local parcel state that shouldn't be version-controlled
+.parcel-local/
