@@ -1,6 +1,6 @@
 ---
 name: parcel
-description: Ship the current work — repo, uncommitted changes, .env files, and the live agent session — to another machine over Tailscale SSH, where the agent resumes in tmux and keeps working. Use when the user says /parcel, "hand off to <machine>", "send this work to another machine", "keep this running after I close the laptop", or wants to move a coding session (Claude Code, Codex, pi, or Droid) to a remote box.
+description: Ship the current work — repo, uncommitted changes, .env files, and the live agent session — to another machine over Tailscale SSH, where the agent resumes in tmux and keeps working. Use when the user says /parcel, "hand off to <machine>", "send this work to another machine", "keep this running after I close the laptop", or wants to move a coding session (Claude Code, Codex, pi, Droid, or Grok Build) to a remote box.
 license: MIT
 ---
 
@@ -25,12 +25,14 @@ The `parcel` CLI is on PATH. Targets are machines defined in
 2. **Ship.** From inside the repo:
 
    ```
-   parcel send <target> --agent <claude|codex|pi|droid> [--session <id>]
+   parcel send <target> --agent <claude|codex|pi|droid|grok> [--session <id>]
    ```
 
    - If you are Claude Code, your session id is the UUID in your scratchpad
-     path (`.../<uuid>/scratchpad`). If unsure, omit `--session` — parcel picks
-     the newest session for this cwd.
+     path (`.../<uuid>/scratchpad`). If you are Grok Build, it is the session
+     directory name under `~/.grok/sessions/<encoded-cwd>/<uuid>/`. If unsure,
+     omit `--session` — parcel picks the newest session for this cwd.
+   - `--agent grok` (alias: `grok-build`) transplants a Grok Build session.
    - `--prompt "..."` steers what the remote agent does first (default:
      read HANDOFF.md and continue).
    - `--idle` ships without launching anything.
@@ -48,7 +50,8 @@ The `parcel` CLI is on PATH. Targets are machines defined in
 - **claude** — user runs `claude login` once on the target, or mints a token on
   an authed machine with `claude setup-token` and sets `CLAUDE_CODE_OAUTH_TOKEN`
   in the target's shell profile.
-- **codex / pi** — `parcel auth <target>` copies the credential files.
+- **codex / pi / grok** — `parcel auth <target>` copies the credential files.
+  Grok alternative: set `XAI_API_KEY` on the target, or run `grok login`.
 - **droid** — user runs `droid` once on the target to log in.
 
 ## Notes
