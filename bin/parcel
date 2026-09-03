@@ -3,10 +3,10 @@
 # machine over Tailscale SSH, where it keeps running in tmux.
 #
 # Agents supported: claude (Claude Code), codex (OpenAI Codex), pi (pi/oh-my-pi),
-# droid (Factory AI).
+# droid (Factory AI), grok (Grok Build / xAI).
 #
 # Usage:
-#   parcel send <target> [--agent claude|codex|pi|droid] [--session <id>]
+#   parcel send <target> [--agent claude|codex|pi|droid|grok] [--session <id>]
 #                        [--prompt "<text>"] [--idle] [--dest <remote-dir>]
 #   parcel status [target]
 #   parcel doctor <target>
@@ -53,9 +53,38 @@ pi_dir()      { echo "$HOME/.pi/agent/sessions/-$(echo "$1" | tr '/' '-')--"; }
 pi_rdir()     { echo ".pi/agent/sessions/-$(echo "$1" | tr '/' '-')--"; }
 droid_dir()   { echo "$HOME/.factory/sessions/$(echo "$1" | tr '/' '-')"; }
 droid_rdir()  { echo ".factory/sessions/$(echo "$1" | tr '/' '-')"; }
+# Grok URL-encodes the absolute cwd ( / → %2F ). Falls back to scanning for a
+# group dir whose .cwd file matches when the encoded name exceeds 255 bytes.
+grok_encode_cwd() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+grok_dir() {
+  local enc; enc="$(grok_encode_cwd "$1")"
+  local d="$HOME/.grok/sessions/$enc"
+  if [[ -d "$d" ]]; then echo "$d"; return; fi
+  # long-path fallback: look for a group dir with matching .cwd
+  local g
+  for g in "$HOME"/.grok/sessions/*/; do
+    [[ -f "${g}.cwd" ]] || continue
+    if [[ "$(cat "${g}.cwd")" == "$1" ]]; then echo "${g%/}"; return; fi
+  done
+  echo "$d"
+}
+grok_rdir() { echo ".grok/sessions/$(grok_encode_cwd "$1")"; }
 
 newest_session_jsonl() {  # $1=dir ; prints newest <uuid>.jsonl path
   ls -t "$1"/*.jsonl 2>/dev/null | grep -E '/[0-9a-f]{8}-[0-9a-f-]{27}\.jsonl$' | head -1
+}
+
+newest_grok_session_dir() {  # $1=group dir ; prints newest <uuid> session dir
+  local d f
+  for d in $(ls -td "$1"/*/ 2>/dev/null); do
+    f="${d}summary.json"
+    [[ -f "$f" ]] || continue
+    echo "${d%/}"
+    return 0
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------- doctor -----
@@ -64,13 +93,14 @@ cmd_doctor() {
   info "checking $name ($HOST) over ssh..."
   ssh -o ConnectTimeout=8 "$HOST" '
     echo "user=$USER home=$HOME"
-    for b in tmux rsync git jq claude codex pi droid; do
+    for b in tmux rsync git jq claude codex pi droid grok; do
       if command -v "$b" >/dev/null 2>&1; then echo "  $b: ok"; else echo "  $b: MISSING"; fi
     done
     [[ -f ~/.claude/.credentials.json || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && echo "  claude auth: ok" || echo "  claude auth: MISSING (run \`claude setup-token\` on a machine with OAuth, export CLAUDE_CODE_OAUTH_TOKEN here, or \`claude login\`)"
     [[ -f ~/.codex/auth.json ]]    && echo "  codex auth: ok"  || echo "  codex auth: MISSING (parcel auth <target> copies it)"
     [[ -f ~/.pi/agent/auth.json ]] && echo "  pi auth: ok"     || echo "  pi auth: MISSING (parcel auth <target> copies it)"
     ls ~/.factory/auth* >/dev/null 2>&1 && echo "  droid auth: present (machine-bound; run \`droid\` once to verify)" || echo "  droid auth: MISSING (run \`droid\` once to log in)"
+    [[ -f ~/.grok/auth.json || -n "${XAI_API_KEY:-}" ]] && echo "  grok auth: ok" || echo "  grok auth: MISSING (parcel auth <target> copies auth.json, or set XAI_API_KEY / run \`grok login\`)"
   '
 }
 
@@ -78,12 +108,14 @@ cmd_doctor() {
 cmd_auth() {
   local name="$1"; load_target "$name"
   info "syncing copyable credentials to $name ($HOST)..."
-  ssh "$HOST" 'mkdir -p ~/.codex ~/.pi/agent'
+  ssh "$HOST" 'mkdir -p ~/.codex ~/.pi/agent ~/.grok'
   [[ -f "$HOME/.codex/auth.json" ]] && { rsync -a "$HOME/.codex/auth.json" "$HOST:.codex/auth.json"; info "codex auth.json → $name"; }
   [[ -f "$HOME/.pi/agent/auth.json" ]] && { rsync -a "$HOME/.pi/agent/auth.json" "$HOST:.pi/agent/auth.json"; info "pi auth.json → $name"; }
+  [[ -f "$HOME/.grok/auth.json" ]] && { rsync -a "$HOME/.grok/auth.json" "$HOST:.grok/auth.json"; info "grok auth.json → $name"; }
   echo "· claude: OAuth is keychain/machine-bound. On $name run \`claude login\`, or mint a token"
   echo "  here with \`claude setup-token\` and set CLAUDE_CODE_OAUTH_TOKEN in the remote shell profile."
   echo "· droid: auth is encrypted per-machine. Run \`droid\` once on $name to log in."
+  echo "· grok: auth.json is copyable (parcel auth). Alternative: set XAI_API_KEY on $name, or run \`grok login\`."
 }
 
 # ---------------------------------------------------------------- status -----
@@ -192,6 +224,41 @@ PYEOF"
   RESUME_CMD="droid exec -s $sid --auto high $(printf '%q' "$PROMPT"); exec bash"
 }
 
+ship_grok() {
+  local sdir; sdir="$(grok_dir "$REPO")"
+  local ssession
+  if [[ -n "$SESSION_ID" ]]; then
+    ssession="$sdir/$SESSION_ID"
+  else
+    ssession="$(newest_grok_session_dir "$sdir" || true)"
+  fi
+  [[ -d "${ssession:-}" && -f "${ssession}/summary.json" ]] || die "no grok session found in $sdir (try --session <id>)"
+  local sid; sid="$(basename "$ssession")"
+  local rdir; rdir="$(grok_rdir "$REMOTE_REPO")"
+  info "grok session $sid → $HOST:$rdir/$sid/"
+  ssh "$HOST" "mkdir -p '$rdir'"
+  rsync -a "$ssession/" "$HOST:$rdir/$sid/"
+  # rewrite cwd + grok_home so resume binds to the remote repo path
+  ssh "$HOST" "sid='$sid' rdir='$rdir' remote_repo='$REMOTE_REPO' python3 - <<'PYEOF'
+import json, os
+from pathlib import Path
+sid = os.environ['sid']
+rdir = os.environ['rdir']
+remote_repo = os.environ['remote_repo']
+path = Path.home() / rdir / sid / 'summary.json'
+try:
+    data = json.loads(path.read_text())
+except Exception:
+    raise SystemExit(0)
+info = data.setdefault('info', {})
+info['id'] = sid
+info['cwd'] = remote_repo
+data['grok_home'] = str(Path.home() / '.grok')
+path.write_text(json.dumps(data, indent=2) + '\n')
+PYEOF"
+  RESUME_CMD="grok --resume $sid --always-approve $(printf '%q' "$PROMPT")"
+}
+
 # ------------------------------------------------------------------ send -----
 cmd_send() {
   local name="$1"; shift
@@ -255,7 +322,8 @@ PYEOF
     codex)  ship_codex ;;
     pi)     ship_pi ;;
     droid)  ship_droid ;;
-    *) die "unknown agent '$AGENT'" ;;
+    grok|grok-build) ship_grok ;;
+    *) die "unknown agent '$AGENT' (claude|codex|pi|droid|grok)" ;;
   esac
 
   # 4. Launch in tmux on the remote
